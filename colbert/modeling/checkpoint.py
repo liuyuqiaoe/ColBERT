@@ -1,11 +1,25 @@
 import torch
 from tqdm import tqdm
 from scipy.cluster.hierarchy import linkage, fcluster
-
+from typing import Union, List, Optional, Tuple, Dict, Any
+from PIL import Image
+import os
 
 from colbert.modeling.tokenization import QueryTokenizer, DocTokenizer
 from colbert.utils.amp import MixedPrecisionManager
 from colbert.modeling.colbert import ColBERT
+from colbert.infra.config import ColBERTConfig
+
+from transformers import CLIPProcessor, CLIPModel
+
+from dataclasses import dataclass
+from colbert.infra.config.core_config import DefaultVal
+from colbert.parameters import DEVICE
+from colbert.infra.config.core_config import CoreConfig
+from colbert.infra.run import Run
+
+from transformers import CLIPConfig
+
 
 
 def pool_embeddings_hierarchical(
@@ -247,3 +261,316 @@ def tokenize_and_encode(checkpoint, passages):
     return embeddings, tokens
 
 """
+
+# Tmp_hfsettings class removed - now integrated into ColBERTConfig as HFSettings
+
+
+
+class HFCheckpoint:
+    def __init__(self, colbert_config: Optional[ColBERTConfig] = None,
+                 verbose: int = 3):
+       
+        self.verbose = verbose
+        self.device = DEVICE
+
+        if colbert_config is not None:
+            self.config = colbert_config
+        else:
+            self.config = ColBERTConfig.from_existing(Run().config)
+
+        # TODO: Validate settings
+        # self.config.validate()
+        
+        self.model_name = self.config.hf_model_name
+        self.model_type = self.config.hf_model_type
+
+        print()
+        # TODO: Set device
+        # self.device = self.settings.device_
+
+        self._load_model()
+        
+        self.amp_manager = MixedPrecisionManager(self.config.hf_amp and self.device == "cuda")
+        
+        self.training = False
+        
+        if self.verbose > 1:
+            print(f"HFCheckpoint initialized:")
+            print(f"  Model: {self.model_name}")
+            print(f"  Type: {self.model_type}")
+            print(f"  Device: {self.device}")
+            print(f"  Embedding dim: {self.embedding_dimension}")
+
+    def _load_model(self):
+        self.has_text_encoder = False
+        self.has_image_encoder = False
+        try:
+            if self.model_type == "clip":
+                self._load_clip_model()
+            else:
+                raise ValueError(f"Unknown model_type: {self.model_type}")
+                
+        except Exception as e:
+            if self.config.hf_fallback_to_clip:
+                print(f"Failed to load model {self.model_name}: {e}")
+                print(f"Falling back to {self.config.hf_fallback_model_name}...")
+                self.model_name = self.config.hf_fallback_model_name
+                self.model_type = "clip"
+                self._load_clip_model()
+            else:
+                raise
+
+    def _load_clip_model(self):
+        self.model = CLIPModel.from_pretrained(
+            self.model_name, 
+            **self.config.hf_model_config_
+        ).to(self.device)
+        self.processor = CLIPProcessor.from_pretrained(self.model_name)                                               
+        self.has_text_encoder = True
+        self.has_image_encoder = True
+        self.embedding_dimension = self.model.projection_dim
+        self.config.configure(hf_embedding_dimension=self.embedding_dimension, dim=self.embedding_dimension)
+
+    def _load_other_model(self):
+        raise NotImplementedError
+
+    def queryFromText(self, queries, bsize=None, to_cpu=False, context=None, full_length_search=False):
+        if not self.has_text_encoder:
+            raise ValueError("This model does not support text encoding")
+            
+        if isinstance(queries, str):
+            queries = [queries]
+            
+        bsize = bsize or self.config.hf_default_batch_size
+        bsize = min(bsize, self.config.hf_max_batch_size)
+        
+        if bsize and len(queries) > bsize:
+            all_embeddings = []
+            for i in range(0, len(queries), bsize):
+                batch_queries = queries[i:i + bsize]
+                batch_embeddings, batch_doclens = self._encode_text_batch(batch_queries, to_cpu) # (batch_size, dim)
+                all_embeddings.append(batch_embeddings)
+            embeddings = torch.cat(all_embeddings)
+            # Add token dimension to make it (batch_size, 1, dim) for ColBERT compatibility
+            embeddings = embeddings.unsqueeze(1)
+            return embeddings
+        else:
+            embeddings, doclens = self._encode_text_batch(queries, to_cpu)
+            # Add token dimension to make it (batch_size, 1, dim) for ColBERT compatibility
+            embeddings = embeddings.unsqueeze(1)
+            return embeddings
+
+    def docFromText(self, docs, bsize=None, keep_dims=True, to_cpu=False, showprogress=False, return_tokens=False):
+        if not self.has_text_encoder:
+            raise ValueError("This model does not support text encoding")
+            
+        if isinstance(docs, str):
+            docs = [docs]
+
+        assert keep_dims in [True, False, "flatten"]
+            
+        bsize = bsize or self.config.hf_default_batch_size
+        bsize = min(bsize, self.config.hf_max_batch_size)
+        
+        if bsize and len(docs) > bsize:
+            all_embeddings = []
+            all_doclens = []
+            
+            iterator = range(0, len(docs), bsize)
+            if showprogress:
+                iterator = tqdm(iterator, desc="Encoding documents", disable=self.verbose < 2)
+                
+            for i in iterator:
+                batch_docs = docs[i:i + bsize]
+                batch_embeddings, batch_doclens = self._encode_text_batch(batch_docs, to_cpu)
+                all_embeddings.append(batch_embeddings)
+                all_doclens.extend(batch_doclens)
+            
+            if keep_dims is True:
+                embeddings = torch.cat(all_embeddings, dim=0)
+                return (embeddings, None)
+                
+            elif keep_dims == "flatten":
+                embeddings = torch.cat(all_embeddings, dim=0)
+                return (embeddings, all_doclens)
+                
+            else: 
+                embeddings_list = []
+                for batch_emb in all_embeddings:
+                    for doc_emb in batch_emb:
+                        embeddings_list.append(doc_emb)
+                        
+                return (embeddings_list, None)
+        else:
+            embeddings, doclens = self._encode_text_batch(docs, to_cpu)
+            
+            if keep_dims is True:
+                return (embeddings, None)
+            elif keep_dims == "flatten":
+                embeddings = embeddings.unsqueeze(1)  # (document_num, 1, dim)
+                return (embeddings, doclens)
+            else: 
+                embeddings_list = []
+                for doc_emb in embeddings:
+                    embeddings_list.append(doc_emb)
+                return (embeddings_list, None)
+
+    def imageFromPath(
+        self, 
+        image_paths,
+        bsize=None,
+        keep_dims=True,
+        to_cpu=False, 
+        showprogress=False,
+        return_tokens=False, # not implemented
+        pool_factor=1, # not implemented
+        protected_tokens=0, # not implemented
+        clustering_mode: str =  "hierarchical", # not implemented
+    ):
+        assert keep_dims in [True, False, "flatten"]
+        # TODO: add clustering mode
+        # assert clustering_mode in ["hierarchical"]
+       
+        if not self.has_image_encoder:
+            raise ValueError("This model does not support image encoding")
+            
+        if isinstance(image_paths, str):
+            image_paths = [image_paths]
+            
+        bsize = bsize or self.config.hf_default_batch_size
+        bsize = min(bsize, self.config.hf_max_batch_size)
+        
+        if bsize and len(image_paths) > bsize:
+            all_embeddings = []
+            iterator = range(0, len(image_paths), bsize)
+            if showprogress:
+                iterator = tqdm(iterator, desc="Encoding images", disable=self.verbose < 2)
+                
+            for i in iterator:
+                batch_paths = image_paths[i:i + bsize]
+                batch_embeddings = self._encode_image_batch(batch_paths, to_cpu)
+                all_embeddings.append(batch_embeddings)
+            embeddings = torch.cat(all_embeddings, dim=0)
+            
+            if keep_dims is True :
+                return (embeddings, None)
+            elif keep_dims == "flatten":
+                doclens = [1]*embeddings.size(0)
+                return (embeddings, doclens)
+            else:  
+                embeddings_list = [emb for emb in embeddings]
+                return (embeddings_list, None)
+        else:
+            embeddings = self._encode_image_batch(image_paths, to_cpu)
+            
+            if keep_dims is True:
+                return (embeddings, None)
+            elif keep_dims == "flatten":
+                embeddings = embeddings.unsqueeze(1)  # (document_num, 1, dim)
+                doclens = [1] * embeddings.size(0)
+                return (embeddings, doclens)
+            else: 
+                embeddings_list = [emb for emb in embeddings]
+                return (embeddings_list, None)
+
+    def imageFromPIL(self, images, bsize=None, keep_dims=True, to_cpu=False, showprogress=False):
+        pass
+
+    def _encode_text_inputs(self, inputs, to_cpu=False):
+        if hasattr(self.model, 'get_text_features'):
+            # CLIP 
+            embeddings = self.model.get_text_features(**inputs)
+        elif hasattr(self.model, 'get_text_embeddings'):
+            # Some models have this method
+            embeddings = self.model.get_text_embeddings(**inputs)
+        else:
+            # last hidden state
+            outputs = self.model(**inputs)
+            embeddings = outputs.last_hidden_state[:, 0, :]  # Use [CLS] token, (batch_size, dim)
+            
+        # Normalize if requested (actually always true)
+        if self.config.hf_normalize_embeddings:
+            embeddings = torch.nn.functional.normalize(embeddings, p=2, dim=1)
+            
+        return embeddings.cpu() if to_cpu else embeddings
+
+    def _encode_text_batch(self, texts, to_cpu=False):
+        inputs = self.processor(
+            text=texts, 
+            **self.config.hf_text_processor_config_
+        )
+        
+        if self.device == "cuda":
+            inputs = {k: v.cuda() for k, v in inputs.items()}
+        
+        with torch.no_grad():
+            with self.amp_manager.context():
+                embeddings = self._encode_text_inputs(inputs)  # [batch_size, hidden_dim]
+                doclens = [1] * embeddings.size(0)
+                return embeddings, doclens
+
+    def _encode_image_batch(self, image_paths, to_cpu=False):
+        processed_images = []
+        for img_path in image_paths:
+            if not os.path.exists(img_path):
+                raise FileNotFoundError(f"Image not found: {img_path}")
+            img = Image.open(img_path)
+           
+            if img.mode in ('P', 'LA', 'PA'):
+                img = img.convert('RGBA').convert('RGB')
+            else:
+                img = img.convert('RGB')
+            processed_images.append(img)
+        
+        inputs = self.processor(
+            images=processed_images, 
+            **self.config.hf_image_processor_config_
+        )
+    
+        if self.device == "cuda":
+            inputs = {k: v.cuda() for k, v in inputs.items()}
+        
+        with torch.no_grad():
+            with self.amp_manager.context():
+                embeddings = self._encode_image_inputs(inputs) # (batch_size, hidden_dim)
+                
+                return embeddings.cpu() if to_cpu else embeddings
+
+    def _encode_pil_batch(self, images, to_cpu=False):
+        pass
+
+    def _encode_image_inputs(self, inputs, to_cpu=False):
+        """Encode image inputs and return embeddings."""
+        if hasattr(self.model, 'get_image_features'):
+            # CLIP
+            embeddings = self.model.get_image_features(**inputs)
+        elif hasattr(self.model, 'get_image_embeddings'):
+            # Some models have this method
+            embeddings = self.model.get_image_embeddings(**inputs)
+        else:
+            outputs = self.model(**inputs)
+            embeddings = outputs.last_hidden_state[:, 0, :]
+         
+        # Normalize if requested
+        if self.config.hf_normalize_embeddings:
+            embeddings = torch.nn.functional.normalize(embeddings, p=2, dim=1)
+            
+        return embeddings.cpu() if to_cpu else embeddings
+    
+    def _stack_3D_tensors(groups):
+        # bsize = sum([x.size(0) for x in groups])
+        # maxlen = max([x.size(1) for x in groups])
+        # hdim = groups[0].size(2)
+
+        # output = torch.zeros(
+        #     bsize, maxlen, hdim, device=groups[0].device, dtype=groups[0].dtype
+        # )
+
+        # offset = 0
+        # for x in groups:
+        #     endpos = offset + x.size(0)
+        #     output[offset:endpos, : x.size(1)] = x
+        #     offset = endpos
+
+        # return output
+        pass

@@ -186,3 +186,79 @@ class SearchSettings:
     centroid_score_threshold: float = DefaultVal(None)
     ndocs: int = DefaultVal(None)
     load_index_with_mmap: bool = DefaultVal(False)
+
+
+@dataclass
+class HFSettings:
+
+    # Model settings
+    hf_model_name: str = DefaultVal("openai/clip-vit-base-patch16")
+    hf_model_type: str = DefaultVal("clip")
+
+    hf_amp: bool = DefaultVal(True)  
+
+    hf_default_batch_size: int = DefaultVal(32)
+    hf_max_batch_size: int = DefaultVal(128)
+
+    # Text encoding settings
+    hf_text_max_length: int = DefaultVal(77)
+    hf_text_truncation: bool = DefaultVal(True)
+    hf_text_padding: bool = DefaultVal(True)
+    hf_text_return_tensors: str = DefaultVal("pt")
+
+    # Image encoding settings
+    hf_image_size: int = DefaultVal(224)
+    hf_image_mean: tuple = DefaultVal((0.485, 0.456, 0.406))
+    hf_image_std: tuple = DefaultVal((0.229, 0.224, 0.225))
+    hf_image_return_tensors: str = DefaultVal("pt")
+
+    # Embedding settings
+    hf_normalize_embeddings: bool = DefaultVal(True) # always normalize embeddings
+    hf_embedding_dimension: int = DefaultVal(None)  # TODO: Auto-detected from model
+
+    # Fallback settings
+    hf_fallback_to_clip: bool = DefaultVal(True)
+    hf_fallback_model_name: str = DefaultVal("openai/clip-vit-base-patch16")
+
+    hf_trust_remote_code: bool = DefaultVal(False)
+
+    @property
+    def hf_model_config_(self):
+        return {
+            "trust_remote_code": self.hf_trust_remote_code,
+        }
+    
+    def hf_validate(self):
+        # TODO: model paramaters validation
+        pass
+    def hf_config_initialization(self):
+        pass
+    @property
+    def hf_text_processor_config_(self):
+        return {
+            "max_length": self.hf_text_max_length,
+            "truncation": self.hf_text_truncation,
+            "padding": self.hf_text_padding,
+            "return_tensors": self.hf_text_return_tensors,
+        }
+    
+    @property
+    def hf_image_processor_config_(self):
+        return {
+            "size": self.hf_image_size,
+            "mean": self.hf_image_mean,
+            "std": self.hf_image_std,
+            "return_tensors": self.hf_image_return_tensors,
+        }
+    
+    def get_hf_model_info(self) -> dict:
+        return {
+            "model_name": self.hf_model_name,
+            "model_type": self.hf_model_type,
+            "embedding_dimension": self.hf_embedding_dimension,
+            "normalize_embeddings": self.hf_normalize_embeddings,
+            "text_max_length": self.hf_text_max_length,
+            "image_size": self.hf_image_size,
+            "default_batch_size": self.hf_default_batch_size,
+            "hf_amp": self.hf_amp,
+        }
