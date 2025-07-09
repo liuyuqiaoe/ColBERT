@@ -11,5 +11,5 @@ class RunConfig(BaseConfig, RunSettings):
 
 @dataclass
 class ColBERTConfig(RunSettings, ResourceSettings, DocSettings, QuerySettings, TrainingSettings,
-                    IndexingSettings, SearchSettings, BaseConfig, TokenizerSettings):
+                    IndexingSettings, SearchSettings, BaseConfig, TokenizerSettings, HFSettings):
     pass

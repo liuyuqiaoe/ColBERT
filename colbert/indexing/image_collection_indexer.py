@@ -17,7 +17,7 @@ import colbert.utils.distributed as distributed
 
 from colbert.infra.run import Run
 from colbert.infra.launcher import print_memory_stats
-from colbert.modeling.checkpoint import Checkpoint
+from colbert.modeling.checkpoint import HFCheckpoint
 from colbert.data.collection import Collection
 
 from colbert.indexing.collection_encoder import CollectionEncoder
@@ -27,34 +27,35 @@ from colbert.utils.utils import flatten, print_message
 
 from colbert.indexing.codecs.residual import ResidualCodec
 
+from colbert.data.collection import ImageCollection
+from colbert.indexing.collection_encoder import HFCollectionEncoder
+from colbert.indexing.collection_indexer import CollectionIndexer
 
 def encode(config, collection, shared_lists, shared_queues, verbose: int = 3):
-    encoder = CollectionIndexer(config=config, collection=collection, verbose=verbose)
+    encoder = ImageCollectionIndexer(config=config, collection=collection, verbose=verbose)
     encoder.run(shared_lists)
 
 
-class CollectionIndexer():
-    '''
-    Given a collection and config, encode collection into index and
-    stores the index on the disk in chunks.
-    '''
-    def __init__(self, config: ColBERTConfig, collection, verbose=2):
+class ImageCollectionIndexer:
+    def __init__(self, config: ColBERTConfig, collection: ImageCollection, verbose=2):
+        # Don't call parent constructor to avoid Collection.cast() issue
         self.verbose = verbose
         self.config = config
         self.rank, self.nranks = self.config.rank, self.config.nranks
-
         self.use_gpu = self.config.total_visible_gpus > 0
 
         if self.config.rank == 0 and self.verbose > 1:
             self.config.help()
 
-        self.collection = Collection.cast(collection)
-        self.checkpoint = Checkpoint(self.config.checkpoint, colbert_config=self.config)
-        if self.use_gpu:
-            self.checkpoint = self.checkpoint.cuda()
+        self.collection = ImageCollection.cast(collection)
 
-        self.encoder = CollectionEncoder(config, self.checkpoint)
-        self.saver = IndexSaver(config)
+        self.checkpoint = HFCheckpoint(colbert_config=self.config)
+        self.encoder = HFCollectionEncoder(
+            config=self.config,
+            checkpoint=self.checkpoint
+        ) 
+
+        self.saver = IndexSaver(self.config) 
 
         print_memory_stats(f'RANK:{self.rank}')
 
@@ -78,12 +79,6 @@ class CollectionIndexer():
             print_memory_stats(f'RANK:{self.rank}')
 
     def setup(self):
-        '''
-        Calculates and saves plan.json for the whole collection.
-        
-        plan.json { config, num_chunks, num_partitions, num_embeddings_est, avg_doclen_est}
-        num_partitions is the number of centroids to be generated.
-        '''
         if self.config.resume:
             if self._try_load_plan():
                 if self.verbose > 1:
@@ -96,14 +91,19 @@ class CollectionIndexer():
 
         self.num_chunks = int(np.ceil(len(self.collection) / self.collection.get_chunksize()))
 
+        # For images, since doc_len is always 1, we need a different approach for num_partitions
+        num_images = len(self.collection)
+        
+        partition_ratio = 0.1  
+        self.num_partitions = max(64, int(num_images * partition_ratio))
+        
+        self.num_partitions = int(2 ** np.floor(np.log2(self.num_partitions)))
+        
         # Saves sampled passages and embeddings for training k-means centroids later 
         sampled_pids = self._sample_pids()
         avg_doclen_est = self._sample_embeddings(sampled_pids)
 
-        # Select the number of partitions
-        num_passages = len(self.collection)
-        self.num_embeddings_est = num_passages * avg_doclen_est
-        self.num_partitions = int(2 ** np.floor(np.log2(16 * np.sqrt(self.num_embeddings_est))))
+        self.num_embeddings_est = num_images * avg_doclen_est
 
         if self.verbose > 0:
             Run().print_main(f'Creating {self.num_partitions:,} partitions.')
@@ -112,28 +112,24 @@ class CollectionIndexer():
         self._save_plan()
 
     def _sample_pids(self):
-        """
-        Samples a representative subset of image indices (pids) from the collection for k-means training.
-        The sampling rate is adaptive to the collection size, ensuring enough diversity for clustering.
-        """
+        # TODO: change the sampling method for images
         num_images = len(self.collection)
-
-        # Adaptive sampling: < 100k: 100%, < 1M: 15%, < 10M: 7%, < 100M: 3%, > 100M: 1%
-        # For images, we use a similar heuristic as for text, but without doclen assumptions.
+        
         sampled_pids = 16 * np.sqrt(num_images)
+        sampled_pids = max(sampled_pids, 4 * self.num_partitions)
         sampled_pids = min(1 + int(sampled_pids), num_images)
-
+        
         sampled_pids = random.sample(range(num_images), sampled_pids)
         if self.verbose > 1:
-            Run().print_main(f"# of sampled image indices = {len(sampled_pids)} \t sampled_pids[:3] = {sampled_pids[:3]}")
+            Run().print_main(f"# of sampled image-path ids = {len(sampled_pids)} \t sampled_pids[:3] = {sampled_pids[:3]}")
 
         return set(sampled_pids)
 
     def _sample_embeddings(self, sampled_pids):
         local_pids = self.collection.enumerate(rank=self.rank)
-        local_sample = [passage for pid, passage in local_pids if pid in sampled_pids]
+        local_sample = [image for pid, image in local_pids if pid in sampled_pids]
 
-        local_sample_embs, doclens = self.encoder.encode_passages(local_sample)
+        local_sample_embs, doclens = self.encoder.encode_images(local_sample)
 
         if torch.cuda.is_available():
             if torch.distributed.is_available() and torch.distributed.is_initialized():
@@ -176,7 +172,7 @@ class CollectionIndexer():
         self.avg_doclen_est = avg_doclen_est
 
         Run().print(f'avg_doclen_est = {avg_doclen_est} \t len(local_sample) = {len(local_sample):,}')
-
+        # TODO: change the index_path for image embeddings
         torch.save(local_sample_embs.half(), os.path.join(self.config.index_path_, f'sample.{self.rank}.pt'))
 
         return avg_doclen_est
@@ -280,6 +276,13 @@ class CollectionIndexer():
         if self.use_gpu:
             torch.cuda.empty_cache()
 
+        # Ensure we have enough training samples for k-means
+        num_training_samples = sample.size(0)
+        if num_training_samples < self.num_partitions:
+            Run().print_main(f"WARNING: Number of training samples ({num_training_samples}) is less than number of partitions ({self.num_partitions})")
+            Run().print_main(f"Reducing num_partitions to {num_training_samples}")
+            self.num_partitions = num_training_samples
+
         do_fork_for_faiss = False  # set to True to free faiss GPU-0 memory at the cost of one more copy of `sample`.
 
         args_ = [self.config.dim, self.num_partitions, self.config.kmeans_niters]
@@ -343,16 +346,6 @@ class CollectionIndexer():
         # sample_avg_residual = (sample - sample_reconstruct).mean(dim=0)
 
     def index(self):
-        '''
-        Encode embeddings for all passages in collection.
-        Each embedding is converted to code (centroid id) and residual.
-        Embeddings stored according to passage order in contiguous chunks of memory.
-
-        Saved data files described below:
-            {CHUNK#}.codes.pt:      centroid id for each embedding in chunk
-            {CHUNK#}.residuals.pt:  16-bits residual for each embedding in chunk
-            doclens.{CHUNK#}.pt:    number of embeddings within each passage in chunk
-        '''
         with self.saver.thread():
             batches = self.collection.enumerate_batches(rank=self.rank)
             for chunk_idx, offset, passages in tqdm.tqdm(batches, disable=self.rank > 0):
@@ -360,8 +353,9 @@ class CollectionIndexer():
                     if self.verbose > 2:
                         Run().print_main(f"#> Found chunk {chunk_idx} in the index already, skipping encoding...")
                     continue
-                # Encode passages into embeddings with the checkpoint model
-                embs, doclens = self.encoder.encode_passages(passages) 
+               
+                embs, doclens = self.encoder.encode_images(passages) 
+            
                 if self.use_gpu:
                     assert embs.dtype == torch.float16
                 else:
@@ -375,17 +369,6 @@ class CollectionIndexer():
                 del embs, doclens
 
     def finalize(self):
-        '''
-        Aggregates and stores metadata for each chunk and the whole index
-        Builds and saves inverse mapping from centroids to passage IDs
-
-        Saved data files described below:
-            {CHUNK#}.metadata.json: [ passage_offset, num_passages, num_embeddings, embedding_offset ]
-            metadata.json: [ num_chunks, num_partitions, num_embeddings, avg_doclen ]
-            inv.pid.pt: [ ivf, ivf_lengths ]
-                ivf is an array of passage IDs for centroids 0, 1, ...
-                ivf_length contains the number of passage IDs for each centroid
-        '''
         if self.rank > 0:
             return
 
@@ -514,12 +497,3 @@ def compute_faiss_kmeans(dim, num_partitions, kmeans_niters, shared_lists, retur
         return_value_queue.put(centroids)
 
     return centroids
-
-
-"""
-TODOs:
-
-1. Consider saving/using heldout_avg_residual as a vector --- that is, using 128 averages!
-
-2. Consider the operations with .cuda() tensors. Are all of them good for OOM?
-"""
