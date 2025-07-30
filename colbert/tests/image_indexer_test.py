@@ -41,8 +41,8 @@ def get_image_collection():
         return []
     
     image_paths = get_image_paths(root_dir)
-    image_paths = sample_image_paths(image_paths, 4000)
-
+    # image_paths = sample_image_paths(image_paths, 4000)
+    print("Image collection length:", len(image_paths))
     collection = ImageCollection(image_paths=image_paths)
 
     collection_path = os.path.join(os.getcwd(), "colbert/tests/image_collection.txt")

@@ -491,6 +491,9 @@ class HFCheckpoint:
         # Normalize if requested (actually always true)
         if self.config.hf_normalize_embeddings:
             embeddings = torch.nn.functional.normalize(embeddings, p=2, dim=1)
+        
+        if self.device.type == "cuda":
+            embeddings = embeddings.half()
             
         return embeddings.cpu() if to_cpu else embeddings
 
@@ -500,13 +503,15 @@ class HFCheckpoint:
             **self.config.hf_text_processor_config_
         )
         
-        if self.device == "cuda":
+        if self.device.type == "cuda":
             inputs = {k: v.cuda() for k, v in inputs.items()}
         
         with torch.no_grad():
             with self.amp_manager.context():
                 embeddings = self._encode_text_inputs(inputs)  # [batch_size, hidden_dim]
                 doclens = [1] * embeddings.size(0)
+                # if self.device.type == "cuda":
+                #     embeddings.half()
                 return embeddings, doclens
 
     def _encode_image_batch(self, image_paths, to_cpu=False):
@@ -527,13 +532,14 @@ class HFCheckpoint:
             **self.config.hf_image_processor_config_
         )
     
-        if self.device == "cuda":
+        if self.device.type == "cuda":
             inputs = {k: v.cuda() for k, v in inputs.items()}
         
         with torch.no_grad():
             with self.amp_manager.context():
                 embeddings = self._encode_image_inputs(inputs) # (batch_size, hidden_dim)
-                
+                # if self.device.type == "cuda":
+                #     embeddings.half()
                 return embeddings.cpu() if to_cpu else embeddings
 
     def _encode_pil_batch(self, images, to_cpu=False):
@@ -554,7 +560,10 @@ class HFCheckpoint:
         # Normalize if requested
         if self.config.hf_normalize_embeddings:
             embeddings = torch.nn.functional.normalize(embeddings, p=2, dim=1)
-            
+
+        if self.device.type == "cuda":
+            embeddings = embeddings.half()
+        
         return embeddings.cpu() if to_cpu else embeddings
     
     def _stack_3D_tensors(groups):

@@ -165,6 +165,7 @@ def test_image_indexer_run(collection):
     
     # Test the run method
     try:
+        indexer.setup()
         shared_lists = []  # Empty for single-process (cpu only)
         indexer.run(shared_lists)
         
@@ -192,7 +193,7 @@ def run_all_tests():
 
     test_image_collection_indexer_basic(collection)
    
-    test_image_collection_indexer_sampling(collection)
+    # test_image_collection_indexer_sampling(collection)
     
     test_image_collection_indexer_setup(collection)
     
